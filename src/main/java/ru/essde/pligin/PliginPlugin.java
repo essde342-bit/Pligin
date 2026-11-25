@@ -40,6 +40,9 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 import java.util.HashSet;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -56,6 +59,8 @@ public final class PliginPlugin extends JavaPlugin implements CommandExecutor, T
     private ExecutorService worker;
     private volatile TestSession activeTest;
     private long nextTestAllowedAt;
+    private final Map<UUID, BossBar> playerHudBars = new HashMap<>();
+    private BukkitTask playerHudTask;
 
     @Override
     public void onEnable() {
@@ -76,7 +81,9 @@ public final class PliginPlugin extends JavaPlugin implements CommandExecutor, T
         getCommand("hosttest").setExecutor(this);
         getCommand("hosttest").setTabCompleter(this);
 
-        getLogger().info("Pligin enabled. Paper server diagnostics are ready.");
+        // Persistent per-player HUD: one bar at the top with live TPS and personal ping.
+        playerHudTask = Bukkit.getScheduler().runTaskTimer(this, this::updatePlayerHud, 1L, 20L);
+        getLogger().info("Pligin enabled. Paper server diagnostics and TPS/Ping HUD are ready.");
     }
 
     private void migrateConfig() {
@@ -98,6 +105,11 @@ public final class PliginPlugin extends JavaPlugin implements CommandExecutor, T
     @Override
     public void onDisable() {
         finishActiveTest(null, true);
+        if (playerHudTask != null) playerHudTask.cancel();
+        for (BossBar bar : playerHudBars.values()) {
+            bar.removeAll();
+        }
+        playerHudBars.clear();
         if (worker != null) {
             worker.shutdownNow();
         }
@@ -128,6 +140,36 @@ public final class PliginPlugin extends JavaPlugin implements CommandExecutor, T
             default -> showHelp(sender, label);
         }
         return true;
+    }
+
+    private void updatePlayerHud() {
+        double[] tpsValues = Bukkit.getServer().getTPS();
+        double tps = Math.max(0.0, Math.min(20.0, safeTps(tpsValues, 0)));
+
+        // Remove bars for players who left, and create one for every online player.
+        playerHudBars.keySet().removeIf(uuid -> {
+            Player online = Bukkit.getPlayer(uuid);
+            if (online != null && online.isOnline()) return false;
+            BossBar oldBar = playerHudBars.get(uuid);
+            if (oldBar != null) oldBar.removeAll();
+            return true;
+        });
+
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            BossBar bar = playerHudBars.computeIfAbsent(player.getUniqueId(), uuid -> {
+                BossBar created = Bukkit.createBossBar("", BarColor.GREEN, BarStyle.SOLID);
+                created.addPlayer(player);
+                return created;
+            });
+            if (!bar.getPlayers().contains(player)) bar.addPlayer(player);
+
+            int ping = Math.max(0, player.getPing());
+            BarColor color = tps >= 18.0 ? BarColor.GREEN : (tps >= 15.0 ? BarColor.YELLOW : BarColor.RED);
+            bar.setColor(color);
+            bar.setProgress(Math.max(0.0, Math.min(1.0, tps / 20.0)));
+            bar.setTitle(color("&bTPS: &f" + String.format(Locale.US, "%.1f", tps)
+                    + " &8| &bPing: &f" + ping + " ms"));
+        }
     }
 
     private void showHelp(CommandSender sender, String label) {
