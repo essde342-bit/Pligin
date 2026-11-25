@@ -680,12 +680,6 @@ public final class PliginPlugin extends JavaPlugin implements CommandExecutor, T
         BukkitTask monitor = Bukkit.getScheduler().runTaskTimer(this, () -> {
             if (activeTest != session) return;
             long now = System.nanoTime();
-            double intervalMs = (now - session.lastTickNanos) / 1_000_000.0;
-            session.lastTickNanos = now;
-            if (intervalMs > 0.0 && intervalMs < 60_000.0) {
-                session.tickMs.add(intervalMs);
-                session.maxMspt = Math.max(session.maxMspt, intervalMs);
-            }
             long elapsedNanos = now - session.startedNanos;
             long elapsedSeconds = TimeUnit.NANOSECONDS.toSeconds(elapsedNanos);
             if (session.bossBar != null && elapsedNanos >= session.lastUiUpdateNanos + 1_000_000_000L) {
@@ -765,24 +759,19 @@ public final class PliginPlugin extends JavaPlugin implements CommandExecutor, T
         long used = runtime.totalMemory() - runtime.freeMemory();
         double endMspt = Bukkit.getServer().getAverageTickTime();
         double[] endTps = Bukkit.getServer().getTPS();
-        List<Double> samples = new ArrayList<>(session.tickMs);
-        Collections.sort(samples);
-        double average = samples.stream().mapToDouble(Double::doubleValue).average().orElse(0.0);
-        double p95 = percentile(samples, 0.95);
-        double peak = session.maxMspt;
         long elapsed = Math.max(1L, TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - session.startedNanos));
 
         send(sender, "Результат теста: " + session.name + " | длительность ~" + elapsed + " сек.");
-        send(sender, String.format(Locale.US, "MSPT Paper: %.2f -> %.2f | замеры тиков: среднее %.2f, P95 %.2f, пик %.2f мс",
-                session.startMspt, endMspt, average, p95, peak));
+        send(sender, String.format(Locale.US, "Средний MSPT Paper: %.2f -> %.2f мс",
+                session.startMspt, endMspt));
         send(sender, String.format(Locale.US, "TPS (окна Paper): %.2f -> %.2f (1 мин.) | heap: %.1f -> %.1f МБ",
                 session.startTps, safeTps(endTps, 0), session.startUsedMb, used / 1024.0 / 1024.0));
-        if (peak >= 50.0) {
-            send(sender, "&cСерверные тики выходили за бюджет 50 мс — нагрузка уже заметно влияет на TPS.");
-        } else if (peak >= 40.0) {
-            send(sender, "&eТики подходили близко к пределу 50 мс.");
+        if (endMspt >= 50.0) {
+            send(sender, "&cСреднее время тика достигло 50 мс или выше — серверу уже тяжело удерживать 20 TPS.");
+        } else if (endMspt >= 40.0) {
+            send(sender, "&eСреднее время тика приблизилось к пределу 50 мс.");
         } else {
-            send(sender, "&aПик замеренного интервала тика ниже 40 мс.");
+            send(sender, "&aСреднее время тика ниже 40 мс — по MSPT запас есть.");
         }
     }
 
@@ -936,13 +925,10 @@ public final class PliginPlugin extends JavaPlugin implements CommandExecutor, T
         private final Set<Entity> entities = new HashSet<>();
         private final List<Future<?>> futures = new ArrayList<>();
         private final List<ExecutorService> executors = new ArrayList<>();
-        private final List<Double> tickMs = new ArrayList<>();
         private final AtomicBoolean cancelled = new AtomicBoolean(false);
         private final long startedNanos = System.nanoTime();
-        private long lastTickNanos = startedNanos;
         private long lastUiUpdateNanos;
         private int durationSeconds = 1;
-        private double maxMspt;
         private double startTps;
         private double startMspt;
         private double startUsedMb;
