@@ -1,0 +1,17 @@
+name: Pligin
+version: '${version}'
+main: ru.essde.pligin.PliginPlugin
+api-version: '1.21.4'
+author: essde
+website: https://github.com/essde342-bit/Pligin
+description: Server diagnostics and controlled host performance testing for Paper 1.21.4
+commands:
+  hosttest:
+    description: Server diagnostics and controlled performance tests
+    usage: /hosttest help
+    aliases: [ht]
+    permission: pligin.admin
+permissions:
+  pligin.admin:
+    description: Allows using all Pligin diagnostics and load-test commands
+    default: op
