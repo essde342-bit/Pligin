@@ -1,14 +1,22 @@
-# Safety limits. These limits are enforced by the plugin even if a command argument is higher.
+# Test only a server you own or have permission to benchmark.
+# Limits are enforced even if a command asks for more.
 safety:
   max-entities: 300
-  max-particles-per-pulse: 1000
-  max-memory-mb: 32
-  max-cpu-seconds: 5
+  max-mobs: 200
+  max-mob-test-duration-seconds: 60
+  mob-test-duration-seconds: 30
+  max-particles-per-pulse: 2000
+  particle-interval-ticks: 5
+  particle-test-duration-seconds: 20
+  max-memory-mb: 128
+  memory-test-duration-seconds: 20
+  max-cpu-threads: 4
+  max-cpu-seconds: 30
+  max-disk-mb: 128
+  max-disk-seconds: 30
   max-benchmark-seconds: 120
   entity-test-duration-seconds: 20
-  particle-test-duration-seconds: 10
-  memory-test-duration-seconds: 15
-  cooldown-seconds: 15
+  cooldown-seconds: 20
 
 messages:
   prefix: '&8[&bPligin&8] &7'
