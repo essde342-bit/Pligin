@@ -9,18 +9,28 @@ import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.command.TabCompleter;
+import org.bukkit.boss.BarColor;
+import org.bukkit.boss.BarStyle;
+import org.bukkit.boss.BossBar;
 import org.bukkit.entity.ArmorStand;
+import org.bukkit.entity.Mob;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.EntityType;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.lang.management.ManagementFactory;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -33,6 +43,8 @@ import java.util.HashSet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.zip.CRC32;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -109,12 +121,15 @@ public final class PliginPlugin extends JavaPlugin implements CommandExecutor, T
         send(sender, "/" + label + " ping [ник] - пинг игрока или свой");
         send(sender, "/" + label + " benchmark [секунды] - замер времени тиков (до 120 сек.)");
         send(sender, "/" + label + " report - сохранить TXT-отчёт в plugins/Pligin/reports");
+        send(sender, "/" + label + " stress mobs <количество> [сек] - активные мобы с ИИ");
         send(sender, "/" + label + " stress entities <количество> - временные ArmorStand-сущности");
-        send(sender, "/" + label + " stress particles <количество> - тест частиц (за один импульс)");
-        send(sender, "/" + label + " stress memory <МБ> - временная загрузка памяти");
-        send(sender, "/" + label + " stress cpu <секунды> - тест одного CPU-потока");
+        send(sender, "/" + label + " stress particles <количество> - частые пачки частиц");
+        send(sender, "/" + label + " stress memory <МБ> - реальная нагрузка на heap");
+        send(sender, "/" + label + " stress cpu [потоки] <сек> - многопоточный CPU-тест");
+        send(sender, "/" + label + " stress disk <МБ> - тест записи и чтения диска");
         send(sender, "/" + label + " stop - остановить текущий тест и очистить его объекты");
-        send(sender, "Все нагрузочные тесты ограничены настройками config.yml и запускаются по одному.");
+        send(sender, "Результаты показывают MSPT, P95, пик задержки тика и изменение TPS.");
+        send(sender, "Нагрузочные тесты запускаются по одному. Используй их только на разрешённом тестовом сервере.");
     }
 
     private void showStatus(CommandSender sender) {
@@ -191,6 +206,7 @@ public final class PliginPlugin extends JavaPlugin implements CommandExecutor, T
 
         TestSession session = beginTest(sender, "бенчмарк");
         if (session == null) return;
+        configureProgress(session, sender, seconds);
 
         send(sender, "Бенчмарк запущен на " + seconds + " сек. Замеряются интервалы между серверными тиками.");
         List<Double> tickTimesMs = new ArrayList<>();
@@ -209,7 +225,7 @@ public final class PliginPlugin extends JavaPlugin implements CommandExecutor, T
             if (activeTest != session) return;
             Collections.sort(tickTimesMs);
             if (tickTimesMs.isEmpty()) {
-                finishActiveTest(null, false);
+                finishActiveTest(sender, false);
                 send(sender, "Бенчмарк завершён, но не удалось собрать замеры.");
                 return;
             }
@@ -221,22 +237,24 @@ public final class PliginPlugin extends JavaPlugin implements CommandExecutor, T
                     "Бенчмарк готов: замеров %d | среднее %.2f мс | P50 %.2f мс | P95 %.2f мс | максимум %.2f мс",
                     tickTimesMs.size(), average, p50, p95, max));
             send(sender, "Ориентир для 20 TPS — 50 мс на тик. P95 показывает, насколько тяжёлыми были медленные тики.");
-            finishActiveTest(null, false);
+            finishActiveTest(sender, false);
         }, seconds * 20L);
         session.tasks.add(finish);
     }
 
     private void handleStress(CommandSender sender, String[] args) {
         if (args.length < 3) {
-            send(sender, "Использование: /hosttest stress <entities|particles|memory|cpu> <значение>");
+            send(sender, "Использование: /hosttest stress <mobs|entities|particles|memory|cpu|disk> <значение>");
             return;
         }
         switch (args[1].toLowerCase(Locale.ROOT)) {
+            case "mobs" -> startMobTest(sender, args);
             case "entities" -> startEntityTest(sender, args[2]);
             case "particles" -> startParticleTest(sender, args[2]);
             case "memory" -> startMemoryTest(sender, args[2]);
-            case "cpu" -> startCpuTest(sender, args[2]);
-            default -> send(sender, "Неизвестный тест. Доступно: entities, particles, memory, cpu.");
+            case "cpu" -> startCpuTest(sender, args);
+            case "disk" -> startDiskTest(sender, args[2]);
+            default -> send(sender, "Доступно: mobs, entities, particles, memory, cpu, disk.");
         }
     }
 
@@ -249,12 +267,13 @@ public final class PliginPlugin extends JavaPlugin implements CommandExecutor, T
             send(sender, "Количество должно быть от 1 до " + max + ".");
             return;
         }
+        int duration = Math.max(5, getConfig().getInt("safety.entity-test-duration-seconds", 20));
         TestSession session = beginTest(sender, "тест сущностей");
         if (session == null) return;
+        configureProgress(session, sender, duration);
 
         World world = player.getWorld();
         Location origin = player.getLocation().clone().add(0, 2.0, 0);
-        int duration = Math.max(5, getConfig().getInt("safety.entity-test-duration-seconds", 20));
         int[] spawned = {0};
         send(sender, "Тест сущностей запущен: " + amount + ". Объекты будут автоматически удалены через " + duration + " сек.");
 
@@ -299,86 +318,278 @@ public final class PliginPlugin extends JavaPlugin implements CommandExecutor, T
         Player player = requirePlayer(sender);
         if (player == null) return;
         Integer amount = parseInt(rawAmount);
-        int max = getConfig().getInt("safety.max-particles-per-pulse", 1000);
-        if (amount == null || amount < 1 || amount > max) {
-            send(sender, "Количество частиц за импульс должно быть от 1 до " + max + ".");
+        int max = getConfig().getInt("safety.max-particles-per-pulse", 2000);
+        if (amount == null || amount < 100 || amount > max) {
+            send(sender, "Количество частиц за импульс должно быть от 100 до " + max + ".");
             return;
         }
-        TestSession session = beginTest(sender, "тест частиц");
+        int duration = Math.max(5, getConfig().getInt("safety.particle-test-duration-seconds", 20));
+        TestSession session = beginTest(sender, "интенсивный тест частиц");
         if (session == null) return;
+        configureProgress(session, sender, duration);
 
-        int duration = Math.max(5, getConfig().getInt("safety.particle-test-duration-seconds", 10));
         Location center = player.getLocation().clone().add(0, 1.0, 0);
         World world = player.getWorld();
-        send(sender, "Тест частиц запущен: " + amount + " частиц раз в секунду, длительность " + duration + " сек.");
+        int intervalTicks = Math.max(2, getConfig().getInt("safety.particle-interval-ticks", 5));
+        long pulsesPerSecond = 20L / intervalTicks;
+        send(sender, "Запущен тест частиц: до " + amount + " за импульс, примерно "
+                + (amount * pulsesPerSecond) + " частиц/сек, " + duration + " сек.");
         BukkitTask particles = Bukkit.getScheduler().runTaskTimer(this, () -> {
             if (activeTest != session) return;
-            world.spawnParticle(Particle.CLOUD, center, amount, 2.0, 1.0, 2.0);
-        }, 0L, 20L);
+            world.spawnParticle(Particle.FLAME, center, amount, 5.0, 2.5, 5.0, 0.02);
+        }, 0L, intervalTicks);
         session.tasks.add(particles);
         scheduleFinish(session, sender, duration, "Тест частиц завершён.");
     }
 
     private void startMemoryTest(CommandSender sender, String rawMb) {
         Integer mb = parseInt(rawMb);
-        int max = getConfig().getInt("safety.max-memory-mb", 32);
-        if (mb == null || mb < 1 || mb > max) {
-            send(sender, "Размер теста должен быть от 1 до " + max + " МБ.");
+        Runtime runtime = Runtime.getRuntime();
+        long usedNow = runtime.totalMemory() - runtime.freeMemory();
+        long headroom = Math.max(0L, runtime.maxMemory() - usedNow);
+        int heapSafeLimit = (int) Math.max(1L, Math.min(runtime.maxMemory() / 4L, headroom / 2L) / (1024L * 1024L));
+        int max = Math.min(getConfig().getInt("safety.max-memory-mb", 128), heapSafeLimit);
+        if (mb == null || mb < 8 || mb > max) {
+            send(sender, "Размер теста должен быть от 8 до " + max + " МБ с учётом текущего свободного heap.");
             return;
         }
-        TestSession session = beginTest(sender, "тест памяти");
+        int duration = Math.max(5, getConfig().getInt("safety.memory-test-duration-seconds", 20));
+        TestSession session = beginTest(sender, "тест памяти heap");
         if (session == null) return;
+        configureProgress(session, sender, duration);
 
-        int duration = Math.max(5, getConfig().getInt("safety.memory-test-duration-seconds", 15));
         AtomicReference<byte[]> allocation = new AtomicReference<>();
-        send(sender, "Тест памяти запущен: выделение " + mb + " МБ на " + duration + " сек. После теста память будет освобождена.");
+        send(sender, "Тест памяти: выделяю " + mb + " МБ и реально заполняю массив. Длительность " + duration + " сек.");
         session.future = worker.submit(() -> {
             try {
                 byte[] bytes = new byte[mb * 1024 * 1024];
-                for (int i = 0; i < bytes.length; i += 4096) bytes[i] = 1;
-                if (!session.cancelled.get() && !Thread.currentThread().isInterrupted()) {
-                    allocation.set(bytes);
-                }
+                for (int i = 0; i < bytes.length; i += 4096) bytes[i] = (byte) (i >>> 12);
+                allocation.set(bytes);
             } catch (OutOfMemoryError error) {
                 if (isEnabled()) {
                     Bukkit.getScheduler().runTask(this, () -> {
                         if (activeTest == session) {
-                            send(sender, "Не удалось выделить память. Тест остановлен; проверь свободную RAM и Xmx.");
-                            finishActiveTest(null, false);
+                            send(sender, "JVM не смогла выделить память. Тест аварийно завершён, массивы очищаются.");
+                            finishActiveTest(sender, false);
                         }
                     });
                 }
             }
         });
-        session.cleanup = () -> {
-            session.cancelled.set(true);
-            allocation.set(null);
-        };
+        session.cleanup = () -> allocation.set(null);
         scheduleFinish(session, sender, duration, "Тест памяти завершён. Временный массив освобождён.");
     }
 
-    private void startCpuTest(CommandSender sender, String rawSeconds) {
-        Integer seconds = parseInt(rawSeconds);
-        int max = getConfig().getInt("safety.max-cpu-seconds", 5);
-        if (seconds == null || seconds < 1 || seconds > max) {
-            send(sender, "Длительность CPU-теста должна быть от 1 до " + max + " секунд.");
+    private void startCpuTest(CommandSender sender, String[] args) {
+        int available = Math.max(1, Runtime.getRuntime().availableProcessors());
+        int maxThreads = Math.max(1, Math.min(8, getConfig().getInt("safety.max-cpu-threads", 4)));
+        int threads = Math.min(maxThreads, available);
+        int seconds;
+        if (args.length >= 4) {
+            Integer parsedThreads = parseInt(args[2]);
+            Integer parsedSeconds = parseInt(args[3]);
+            if (parsedThreads == null || parsedSeconds == null) {
+                send(sender, "Использование: /hosttest stress cpu <потоки> <секунды>");
+                return;
+            }
+            threads = parsedThreads;
+            seconds = parsedSeconds;
+        } else {
+            Integer parsedSeconds = parseInt(args[2]);
+            if (parsedSeconds == null) {
+                send(sender, "Использование: /hosttest stress cpu [потоки] <секунды>");
+                return;
+            }
+            seconds = parsedSeconds;
+        }
+
+        int maxSeconds = Math.max(1, getConfig().getInt("safety.max-cpu-seconds", 30));
+        if (threads < 1 || threads > maxThreads || seconds < 1 || seconds > maxSeconds) {
+            send(sender, "Допустимо: 1-" + maxThreads + " потоков и 1-" + maxSeconds + " секунд.");
             return;
         }
-        TestSession session = beginTest(sender, "тест CPU");
+        TestSession session = beginTest(sender, "CPU-тест (" + threads + " потоков)");
         if (session == null) return;
+        configureProgress(session, sender, seconds);
 
         AtomicBoolean cancelled = session.cancelled;
-        session.cleanup = () -> cancelled.set(true);
-        send(sender, "CPU-тест запущен в одном фоновом потоке на " + seconds + " сек. Основной поток сервера не блокируется специально.");
-        session.future = worker.submit(() -> {
-            long endAt = System.nanoTime() + seconds * 1_000_000_000L;
-            double value = 0.25;
-            while (!cancelled.get() && !Thread.currentThread().isInterrupted() && System.nanoTime() < endAt) {
-                value = Math.sin(value + 0.0001) + Math.sqrt(Math.abs(value) + 1.0);
-            }
-            double result = value;
+        ExecutorService pool = Executors.newFixedThreadPool(threads, runnable -> {
+            Thread thread = new Thread(runnable, "Pligin-CPU-Stress");
+            thread.setDaemon(true);
+            return thread;
         });
-        scheduleFinish(session, sender, seconds, "CPU-тест завершён.");
+        session.executors.add(pool);
+        long endAt = System.nanoTime() + TimeUnit.SECONDS.toNanos(seconds);
+        send(sender, "CPU-тест запущен: " + threads + " поток(а/ов) на " + seconds + " сек. Это реальная вычислительная нагрузка на CPU.");
+        for (int i = 0; i < threads; i++) {
+            Future<?> future = pool.submit(() -> {
+                double value = 0.123456789;
+                while (!cancelled.get() && !Thread.currentThread().isInterrupted() && System.nanoTime() < endAt) {
+                    value = Math.fma(value, 1.0000001, Math.sqrt(Math.abs(value) + 0.000001));
+                    if (value > 1000.0) value = Math.log(value);
+                }
+                session.cpuIterations.add(1L);
+            });
+            session.futures.add(future);
+        }
+        scheduleFinish(session, sender, seconds, "CPU-тест завершён. Рабочие потоки остановлены.");
+    }
+
+    private void startMobTest(CommandSender sender, String[] args) {
+        Player player = requirePlayer(sender);
+        if (player == null) return;
+        Integer amount = parseInt(args[2]);
+        int max = getConfig().getInt("safety.max-mobs", 200);
+        int duration = getConfig().getInt("safety.mob-test-duration-seconds", 30);
+        if (args.length >= 4) {
+            Integer parsedDuration = parseInt(args[3]);
+            if (parsedDuration == null) {
+                send(sender, "Длительность указывается в секундах.");
+                return;
+            }
+            duration = parsedDuration;
+        }
+        int maxDuration = getConfig().getInt("safety.max-mob-test-duration-seconds", 60);
+        if (amount == null || amount < 1 || amount > max || duration < 5 || duration > maxDuration) {
+            send(sender, "Количество мобов: 1-" + max + "; длительность: 5-" + maxDuration + " сек.");
+            return;
+        }
+
+        TestSession session = beginTest(sender, "тест активных мобов с ИИ");
+        if (session == null) return;
+        configureProgress(session, sender, duration);
+        World world = player.getWorld();
+        Location origin = player.getLocation().clone();
+        int[] spawned = {0};
+        send(sender, "Запущен тест AI: " + amount + " зомби с включённым ИИ. Они неуязвимы, не подбирают вещи и удалятся через " + duration + " сек.");
+
+        BukkitTask[] spawner = new BukkitTask[1];
+        spawner[0] = Bukkit.getScheduler().runTaskTimer(this, () -> {
+            if (activeTest != session) return;
+            int batch = Math.min(5, amount - spawned[0]);
+            for (int i = 0; i < batch; i++) {
+                int index = spawned[0]++;
+                double angle = index * 2.399963229728653;
+                double radius = 5.0 + (index % 9) * 0.7;
+                int x = origin.getBlockX() + (int) Math.round(Math.cos(angle) * radius);
+                int z = origin.getBlockZ() + (int) Math.round(Math.sin(angle) * radius);
+                int y = world.getHighestBlockYAt(x, z) + 1;
+                try {
+                    Entity entity = world.spawnEntity(new Location(world, x + 0.5, y, z + 0.5), EntityType.ZOMBIE);
+                    if (entity instanceof Mob mob) {
+                        mob.setAI(true);
+                        mob.setAware(true);
+                        mob.setInvulnerable(true);
+                        mob.setSilent(true);
+                        mob.setPersistent(true);
+                        mob.setRemoveWhenFarAway(false);
+                        mob.setCanPickupItems(false);
+                        mob.setCollidable(false);
+                        session.entities.add(mob);
+                    } else {
+                        entity.remove();
+                    }
+                } catch (RuntimeException exception) {
+                    getLogger().warning("Could not spawn AI test mob: " + exception.getMessage());
+                }
+            }
+            if (spawned[0] >= amount) {
+                spawner[0].cancel();
+                send(sender, "Создано AI-мобов: " + session.entities.size() + ". Нагрузка продолжается до конца таймера.");
+            }
+        }, 1L, 1L);
+        session.tasks.add(spawner[0]);
+        scheduleFinish(session, sender, duration, "Тест мобов завершён. Все тестовые мобы удалены.");
+    }
+
+    private void startDiskTest(CommandSender sender, String rawMb) {
+        Integer mb = parseInt(rawMb);
+        int max = Math.max(8, getConfig().getInt("safety.max-disk-mb", 128));
+        if (mb == null || mb < 8 || mb > max) {
+            send(sender, "Размер дискового теста должен быть от 8 до " + max + " МБ.");
+            return;
+        }
+        int maxSeconds = Math.max(5, getConfig().getInt("safety.max-disk-seconds", 30));
+        TestSession session = beginTest(sender, "тест диска");
+        if (session == null) return;
+        configureProgress(session, sender, maxSeconds);
+        send(sender, "Дисковый тест: запись и чтение " + mb + " МБ во временный файл, проверка контрольной суммы. Файл будет удалён.");
+
+        session.future = worker.submit(() -> {
+            Path temp = null;
+            String result;
+            long started = System.nanoTime();
+            long deadline = started + TimeUnit.SECONDS.toNanos(maxSeconds);
+            long bytesWritten = 0;
+            long bytesRead = 0;
+            double writeRate = 0.0;
+            double readRate = 0.0;
+            boolean verified = false;
+            try {
+                Path directory = getDataFolder().toPath();
+                Files.createDirectories(directory);
+                temp = Files.createTempFile(directory, "pligin-disk-test-", ".tmp");
+                byte[] buffer = new byte[1024 * 1024];
+                for (int i = 0; i < buffer.length; i++) buffer[i] = (byte) (i * 31 + 7);
+                CRC32 writeCrc = new CRC32();
+                long writeStart = System.nanoTime();
+                try (OutputStream output = new BufferedOutputStream(Files.newOutputStream(temp))) {
+                    long targetBytes = mb * 1024L * 1024L;
+                    while (bytesWritten < targetBytes && !session.cancelled.get()
+                            && !Thread.currentThread().isInterrupted() && System.nanoTime() < deadline) {
+                        int chunk = (int) Math.min(buffer.length, targetBytes - bytesWritten);
+                        output.write(buffer, 0, chunk);
+                        writeCrc.update(buffer, 0, chunk);
+                        bytesWritten += chunk;
+                    }
+                    output.flush();
+                }
+                try (FileChannel channel = FileChannel.open(temp, StandardOpenOption.WRITE)) {
+                    channel.force(true);
+                }
+                double writeSeconds = Math.max(0.001, (System.nanoTime() - writeStart) / 1_000_000_000.0);
+                writeRate = bytesWritten / 1024.0 / 1024.0 / writeSeconds;
+
+                if (bytesWritten == mb * 1024L * 1024L && !session.cancelled.get() && System.nanoTime() < deadline) {
+                    CRC32 readCrc = new CRC32();
+                    long readStart = System.nanoTime();
+                    byte[] readBuffer = new byte[1024 * 1024];
+                    try (InputStream input = new BufferedInputStream(Files.newInputStream(temp))) {
+                        int read;
+                        while ((read = input.read(readBuffer)) != -1) {
+                            readCrc.update(readBuffer, 0, read);
+                            bytesRead += read;
+                            if (session.cancelled.get() || Thread.currentThread().isInterrupted() || System.nanoTime() >= deadline) break;
+                        }
+                    }
+                    double readSeconds = Math.max(0.001, (System.nanoTime() - readStart) / 1_000_000_000.0);
+                    readRate = bytesRead / 1024.0 / 1024.0 / readSeconds;
+                    verified = bytesRead == bytesWritten && readCrc.getValue() == writeCrc.getValue();
+                }
+                result = "Диск: записано " + formatMb(bytesWritten) + " МБ (" + String.format(Locale.US, "%.1f", writeRate) + " МБ/с), прочитано "
+                        + formatMb(bytesRead) + " МБ (" + String.format(Locale.US, "%.1f", readRate)
+                        + " МБ/с), checksum " + (verified ? "OK" : "НЕ ПРОЙДЕНА/ТЕСТ НЕ ЗАВЕРШЁН") + ".";
+            } catch (IOException | RuntimeException exception) {
+                result = "Ошибка дискового теста: " + exception.getMessage();
+            } finally {
+                if (temp != null) {
+                    try {
+                        Files.deleteIfExists(temp);
+                    } catch (IOException exception) {
+                        getLogger().warning("Could not remove temporary disk benchmark file: " + exception.getMessage());
+                    }
+                }
+            }
+            String finalResult = result + " Временный файл удалён.";
+            if (isEnabled()) {
+                Bukkit.getScheduler().runTask(this, () -> {
+                    if (activeTest == session) {
+                        finishActiveTest(sender, false);
+                        send(sender, finalResult);
+                    }
+                });
+            }
+        });
     }
 
     private TestSession beginTest(CommandSender sender, String name) {
@@ -396,10 +607,44 @@ public final class PliginPlugin extends JavaPlugin implements CommandExecutor, T
         return activeTest;
     }
 
+    private void configureProgress(TestSession session, CommandSender sender, int durationSeconds) {
+        session.durationSeconds = durationSeconds;
+        if (sender instanceof Player player) {
+            session.bossBar = Bukkit.createBossBar(
+                    color("&bPligin &7| &fНагрузочный тест &8- &aстарт"),
+                    BarColor.BLUE, BarStyle.SOLID);
+            session.bossBar.addPlayer(player);
+            session.bossBar.setProgress(1.0);
+        }
+        BukkitTask monitor = Bukkit.getScheduler().runTaskTimer(this, () -> {
+            if (activeTest != session) return;
+            long now = System.nanoTime();
+            double intervalMs = (now - session.lastTickNanos) / 1_000_000.0;
+            session.lastTickNanos = now;
+            if (intervalMs > 0.0 && intervalMs < 60_000.0) {
+                session.tickMs.add(intervalMs);
+                session.maxMspt = Math.max(session.maxMspt, intervalMs);
+            }
+            long elapsedNanos = now - session.startedNanos;
+            long elapsedSeconds = TimeUnit.NANOSECONDS.toSeconds(elapsedNanos);
+            if (session.bossBar != null && elapsedNanos >= session.lastUiUpdateNanos + 1_000_000_000L) {
+                session.lastUiUpdateNanos = elapsedNanos;
+                double progress = Math.min(1.0, elapsedNanos / (double) TimeUnit.SECONDS.toNanos(durationSeconds));
+                session.bossBar.setProgress(Math.max(0.0, 1.0 - progress));
+                double currentMspt = Bukkit.getServer().getAverageTickTime();
+                double estimatedTps = currentMspt <= 0.0 ? 20.0 : Math.min(20.0, 1000.0 / currentMspt);
+                session.bossBar.setTitle(color("&bPligin &7| &f" + Math.max(0, durationSeconds - elapsedSeconds)
+                        + "с &8| &e" + String.format(Locale.US, "%.1f", currentMspt) + " MSPT"
+                        + " &8| &a~" + String.format(Locale.US, "%.1f", estimatedTps) + " TPS"));
+            }
+        }, 1L, 1L);
+        session.tasks.add(monitor);
+    }
+
     private void scheduleFinish(TestSession session, CommandSender sender, int seconds, String message) {
         BukkitTask task = Bukkit.getScheduler().runTaskLater(this, () -> {
             if (activeTest != session) return;
-            finishActiveTest(null, false);
+            finishActiveTest(sender, false);
             send(sender, message);
         }, seconds * 20L);
         session.tasks.add(task);
@@ -411,7 +656,7 @@ public final class PliginPlugin extends JavaPlugin implements CommandExecutor, T
             return;
         }
         String name = activeTest.name;
-        finishActiveTest(null, false);
+        finishActiveTest(sender, false);
         send(sender, "Тест " + name + " остановлен. Временные объекты очищены.");
     }
 
@@ -420,10 +665,26 @@ public final class PliginPlugin extends JavaPlugin implements CommandExecutor, T
         if (session == null) return;
         activeTest = null;
         session.cancelled.set(true);
+
+        if (!silent && sender != null) {
+            sendSessionMetrics(sender, session);
+        }
+
         for (BukkitTask task : session.tasks) {
             if (task != null) task.cancel();
         }
+        for (Future<?> future : session.futures) {
+            future.cancel(true);
+        }
         if (session.future != null) session.future.cancel(true);
+        for (ExecutorService executor : session.executors) {
+            executor.shutdownNow();
+            try {
+                executor.awaitTermination(250, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
         for (Entity entity : session.entities) {
             if (entity != null && entity.isValid()) entity.remove();
         }
@@ -434,9 +695,38 @@ public final class PliginPlugin extends JavaPlugin implements CommandExecutor, T
                 getLogger().warning("Test cleanup failed: " + exception.getMessage());
             }
         }
+        if (session.bossBar != null) {
+            session.bossBar.removeAll();
+        }
         if (!silent) {
             int cooldown = Math.max(0, getConfig().getInt("safety.cooldown-seconds", 15));
             nextTestAllowedAt = System.currentTimeMillis() + cooldown * 1000L;
+        }
+    }
+
+    private void sendSessionMetrics(CommandSender sender, TestSession session) {
+        Runtime runtime = Runtime.getRuntime();
+        long used = runtime.totalMemory() - runtime.freeMemory();
+        double endMspt = Bukkit.getServer().getAverageTickTime();
+        double[] endTps = Bukkit.getServer().getTPS();
+        List<Double> samples = new ArrayList<>(session.tickMs);
+        Collections.sort(samples);
+        double average = samples.stream().mapToDouble(Double::doubleValue).average().orElse(0.0);
+        double p95 = percentile(samples, 0.95);
+        double peak = session.maxMspt;
+        long elapsed = Math.max(1L, TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - session.startedNanos));
+
+        send(sender, "Результат теста: " + session.name + " | длительность ~" + elapsed + " сек.");
+        send(sender, String.format(Locale.US, "MSPT Paper: %.2f -> %.2f | замеры тиков: среднее %.2f, P95 %.2f, пик %.2f мс",
+                session.startMspt, endMspt, average, p95, peak));
+        send(sender, String.format(Locale.US, "TPS (окна Paper): %.2f -> %.2f (1 мин.) | heap: %.1f -> %.1f МБ",
+                session.startTps, safeTps(endTps, 0), session.startUsedMb, used / 1024.0 / 1024.0));
+        if (peak >= 50.0) {
+            send(sender, "&cСерверные тики выходили за бюджет 50 мс — нагрузка уже заметно влияет на TPS.");
+        } else if (peak >= 40.0) {
+            send(sender, "&eТики подходили близко к пределу 50 мс.");
+        } else {
+            send(sender, "&aПик замеренного интервала тика ниже 40 мс.");
         }
     }
 
@@ -557,17 +847,19 @@ public final class PliginPlugin extends JavaPlugin implements CommandExecutor, T
             return filter(List.of("help", "status", "players", "worlds", "ping", "benchmark", "report", "stress", "stop"), args[0]);
         }
         if (args.length == 2 && args[0].equalsIgnoreCase("stress")) {
-            return filter(List.of("entities", "particles", "memory", "cpu"), args[1]);
+            return filter(List.of("mobs", "entities", "particles", "memory", "cpu", "disk"), args[1]);
         }
         if (args.length == 2 && args[0].equalsIgnoreCase("ping")) {
             return filter(Bukkit.getOnlinePlayers().stream().map(Player::getName).toList(), args[1]);
         }
         if (args.length == 3 && args[0].equalsIgnoreCase("stress")) {
             return switch (args[1].toLowerCase(Locale.ROOT)) {
+                case "mobs" -> filter(List.of("50", "100", "150", "200"), args[2]);
                 case "entities" -> filter(List.of("50", "100", "200", "300"), args[2]);
-                case "particles" -> filter(List.of("100", "250", "500", "1000"), args[2]);
-                case "memory" -> filter(List.of("8", "16", "32"), args[2]);
-                case "cpu" -> filter(List.of("1", "3", "5"), args[2]);
+                case "particles" -> filter(List.of("500", "1000", "1500", "2000"), args[2]);
+                case "memory" -> filter(List.of("32", "64", "96", "128"), args[2]);
+                case "cpu" -> filter(List.of("2", "4", "8"), args[2]);
+                case "disk" -> filter(List.of("32", "64", "128"), args[2]);
                 default -> Collections.emptyList();
             };
         }
@@ -586,12 +878,29 @@ public final class PliginPlugin extends JavaPlugin implements CommandExecutor, T
         private final String name;
         private final List<BukkitTask> tasks = new ArrayList<>();
         private final Set<Entity> entities = new HashSet<>();
+        private final List<Future<?>> futures = new ArrayList<>();
+        private final List<ExecutorService> executors = new ArrayList<>();
+        private final List<Double> tickMs = new ArrayList<>();
+        private final List<Long> cpuIterations = new ArrayList<>();
         private final AtomicBoolean cancelled = new AtomicBoolean(false);
+        private final long startedNanos = System.nanoTime();
+        private long lastTickNanos = startedNanos;
+        private long lastUiUpdateNanos;
+        private int durationSeconds = 1;
+        private double maxMspt;
+        private double startTps;
+        private double startMspt;
+        private double startUsedMb;
         private Future<?> future;
         private Runnable cleanup;
+        private BossBar bossBar;
 
         private TestSession(String name) {
             this.name = name;
+            Runtime runtime = Runtime.getRuntime();
+            this.startUsedMb = (runtime.totalMemory() - runtime.freeMemory()) / 1024.0 / 1024.0;
+            this.startMspt = Bukkit.getServer().getAverageTickTime();
+            this.startTps = safeTps(Bukkit.getServer().getTPS(), 0);
         }
     }
 }
