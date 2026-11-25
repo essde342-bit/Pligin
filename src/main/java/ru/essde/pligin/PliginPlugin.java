@@ -336,7 +336,7 @@ public final class PliginPlugin extends JavaPlugin implements CommandExecutor, T
                 + (amount * pulsesPerSecond) + " частиц/сек, " + duration + " сек.");
         BukkitTask particles = Bukkit.getScheduler().runTaskTimer(this, () -> {
             if (activeTest != session) return;
-            world.spawnParticle(Particle.FLAME, center, amount, 5.0, 2.5, 5.0, 0.02);
+            world.spawnParticle(Particle.FLAME, center, amount, 5.0, 2.5, 5.0, null);
         }, 0L, intervalTicks);
         session.tasks.add(particles);
         scheduleFinish(session, sender, duration, "Тест частиц завершён.");
