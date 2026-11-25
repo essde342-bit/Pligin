@@ -1,0 +1,14 @@
+# Safety limits. These limits are enforced by the plugin even if a command argument is higher.
+safety:
+  max-entities: 300
+  max-particles-per-pulse: 1000
+  max-memory-mb: 32
+  max-cpu-seconds: 5
+  max-benchmark-seconds: 120
+  entity-test-duration-seconds: 20
+  particle-test-duration-seconds: 10
+  memory-test-duration-seconds: 15
+  cooldown-seconds: 15
+
+messages:
+  prefix: '&8[&bPligin&8] &7'
