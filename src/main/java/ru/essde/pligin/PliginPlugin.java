@@ -363,8 +363,11 @@ public final class PliginPlugin extends JavaPlugin implements CommandExecutor, T
         session.future = worker.submit(() -> {
             try {
                 byte[] bytes = new byte[mb * 1024 * 1024];
-                for (int i = 0; i < bytes.length; i += 4096) bytes[i] = (byte) (i >>> 12);
-                allocation.set(bytes);
+                for (int i = 0; i < bytes.length; i += 4096) {
+                    if (session.cancelled.get() || Thread.currentThread().isInterrupted()) return;
+                    bytes[i] = (byte) (i >>> 12);
+                }
+                if (!session.cancelled.get()) allocation.set(bytes);
             } catch (OutOfMemoryError error) {
                 if (isEnabled()) {
                     Bukkit.getScheduler().runTask(this, () -> {
@@ -428,7 +431,6 @@ public final class PliginPlugin extends JavaPlugin implements CommandExecutor, T
                     value = Math.fma(value, 1.0000001, Math.sqrt(Math.abs(value) + 0.000001));
                     if (value > 1000.0) value = Math.log(value);
                 }
-                session.cpuIterations.add(1L);
             });
             session.futures.add(future);
         }
@@ -881,7 +883,6 @@ public final class PliginPlugin extends JavaPlugin implements CommandExecutor, T
         private final List<Future<?>> futures = new ArrayList<>();
         private final List<ExecutorService> executors = new ArrayList<>();
         private final List<Double> tickMs = new ArrayList<>();
-        private final List<Long> cpuIterations = new ArrayList<>();
         private final AtomicBoolean cancelled = new AtomicBoolean(false);
         private final long startedNanos = System.nanoTime();
         private long lastTickNanos = startedNanos;
