@@ -60,6 +60,7 @@ public final class PliginPlugin extends JavaPlugin implements CommandExecutor, T
     @Override
     public void onEnable() {
         saveDefaultConfig();
+        migrateConfig();
         prefix = color(getConfig().getString("messages.prefix", "&8[&bPligin&8] &7"));
         worker = Executors.newSingleThreadExecutor(runnable -> {
             Thread thread = new Thread(runnable, "Pligin-Test-Worker");
@@ -76,6 +77,22 @@ public final class PliginPlugin extends JavaPlugin implements CommandExecutor, T
         getCommand("hosttest").setTabCompleter(this);
 
         getLogger().info("Pligin enabled. Paper server diagnostics are ready.");
+    }
+
+    private void migrateConfig() {
+        int configVersion = getConfig().getInt("config-version", 1);
+        if (configVersion < 2) {
+            // Upgrade shipped defaults only; preserve values explicitly customized by the owner.
+            if (getConfig().getInt("safety.max-particles-per-pulse", 1000) == 1000) getConfig().set("safety.max-particles-per-pulse", 2000);
+            if (getConfig().getInt("safety.max-memory-mb", 32) == 32) getConfig().set("safety.max-memory-mb", 128);
+            if (getConfig().getInt("safety.max-cpu-seconds", 5) == 5) getConfig().set("safety.max-cpu-seconds", 30);
+            if (getConfig().getInt("safety.particle-test-duration-seconds", 10) == 10) getConfig().set("safety.particle-test-duration-seconds", 20);
+            if (getConfig().getInt("safety.memory-test-duration-seconds", 15) == 15) getConfig().set("safety.memory-test-duration-seconds", 20);
+            if (getConfig().getInt("safety.cooldown-seconds", 15) == 15) getConfig().set("safety.cooldown-seconds", 20);
+            getConfig().set("config-version", 2);
+        }
+        getConfig().options().copyDefaults(true);
+        saveConfig();
     }
 
     @Override
@@ -681,11 +698,6 @@ public final class PliginPlugin extends JavaPlugin implements CommandExecutor, T
         if (session.future != null) session.future.cancel(true);
         for (ExecutorService executor : session.executors) {
             executor.shutdownNow();
-            try {
-                executor.awaitTermination(250, TimeUnit.MILLISECONDS);
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-            }
         }
         for (Entity entity : session.entities) {
             if (entity != null && entity.isValid()) entity.remove();
@@ -800,7 +812,7 @@ public final class PliginPlugin extends JavaPlugin implements CommandExecutor, T
         } catch (IOException | RuntimeException exception) {
             out.append("unavailable (plugin data folder may not exist yet)\n");
         }
-        out.append("\nNote: CPU usage percentage is not sampled; CPU test is a controlled single-worker load test.\n");
+        out.append("\nNote: CPU usage percentage is not sampled; CPU test uses a bounded multi-worker load test.\n");
         return out.toString();
     }
 
